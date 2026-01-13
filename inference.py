@@ -5,8 +5,14 @@ This script performs frame interpolation between two input images using a pre-tr
 It handles memory constraints automatically by downscaling large images and restoring them
 to the original resolution and aspect ratio after inference.
 
+Supports Recursive Interpolation (Multi-pass) to generate slow-motion sequences.
+
 Example Usage:
-    python inference.py --img1 frame0.png --img2 frame1.png --output result.png --max_size 960
+    # Standard (1 frame at 50%)
+    python inference.py --img1 frame1.png --img2 frame2.png --output result.png
+
+    # Recursive (Depth 3 -> 7 frames: 12.5%, 25%, 37.5%, 50%, etc.)
+    python inference.py --img1 start.png --img2 end.png --output seq.png --depth 3 --max_size 960
 """
 
 import argparse
@@ -82,8 +88,48 @@ def save_image(tensor, path):
     img_pil.save(path)
     print(f"✅ Output saved to: {path}")
 
+def post_process_tensor(output, orig_w, orig_h, pad_w, pad_h):
+    """Crops padding and restores original resolution."""
+    # a) Remove padding
+    _, _, H_pad, W_pad = output.shape
+    crop_w = W_pad - pad_w
+    crop_h = H_pad - pad_h
+    output = output[:, :, :crop_h, :crop_w]
+
+    # b) Upscale to exact original dimensions
+    output = F.interpolate(output, size=(orig_h, orig_w), mode='bicubic', align_corners=False)
+    return output
+
+def run_model_step(model, I0, I1, dummy_points, dummy_region_flow):
+    """Runs a single inference step between two tensors."""
+    with torch.no_grad():
+        output = model(I0, I1, dummy_points, dummy_region_flow)
+        if isinstance(output, (list, tuple)):
+            output = output[0]
+    return output
+
+def recursive_generator(model, I0, I1, depth, dummy_points, dummy_region_flow):
+    """
+    Generator that recursively interpolates frames.
+    Yields frames in temporal order (In-Order Traversal).
+    """
+    if depth == 0:
+        return
+
+    # Generate Mid Frame (t=0.5 between current I0 and I1)
+    mid = run_model_step(model, I0, I1, dummy_points, dummy_region_flow)
+
+    # 1. Recurse Left (t=0 to t=0.5)
+    yield from recursive_generator(model, I0, mid, depth - 1, dummy_points, dummy_region_flow)
+
+    # 2. Yield Current Mid Frame
+    yield mid
+
+    # 3. Recurse Right (t=0.5 to t=1)
+    yield from recursive_generator(model, mid, I1, depth - 1, dummy_points, dummy_region_flow)
+
 def run_inference(args):
-    print(f"🔧 Setting up SAIN model (Max resolution: {args.max_size}px)...")
+    print(f"🔧 Setting up SAIN model (Max resolution: {args.max_size}px, Recursive Depth: {args.depth})...")
 
     # 1. Initialize Model Configuration
     model_args = InferenceConfig()
@@ -154,47 +200,52 @@ def run_inference(args):
         I0 = F.pad(I0, (0, pad_w, 0, pad_h), mode='replicate')
         I1 = F.pad(I1, (0, pad_w, 0, pad_h), mode='replicate')
 
-    # 4. Generate Dummy Inputs
-    # SAIN requires 'points' and 'region_flow' as inputs.
-    # For raw inference, we provide zero-tensors with correct shapes.
+    # 4. Generate Dummy Inputs (Created ONCE to save memory/time)
     B, _, H_pad, W_pad = I0.shape
-
-    # Points: Expects 1-channel mask (Batch, 1, H, W)
     dummy_points = torch.zeros(B, 1, H_pad, W_pad).to(model_args.device)
-
-    # Region Flow: Expects a list of 2 tensors (Forward/Backward), each with 2 channels
     flow_tensor = torch.zeros(B, 2, H_pad, W_pad).to(model_args.device)
     dummy_region_flow = [flow_tensor, flow_tensor]
 
-    # 5. Inference
-    print("🚀 Generating intermediate frame...")
-    with torch.no_grad():
-        output = model(I0, I1, dummy_points, dummy_region_flow)
+    # 5. Inference Loop
+    total_frames = (2 ** args.depth) - 1
+    print(f"🚀 Generating {total_frames} intermediate frames (Depth: {args.depth})...")
 
-        # Handle list/tuple output
-        if isinstance(output, (list, tuple)):
-            output = output[0]
+    # If depth == 1, maintain backward compatibility (save exactly to args.output)
+    if args.depth == 1:
+        mid_tensor = run_model_step(model, I0, I1, dummy_points, dummy_region_flow)
+        final_output = post_process_tensor(mid_tensor, orig_w, orig_h, pad_w, pad_h)
+        save_image(final_output, args.output)
 
-    # 6. Post-processing (Crop Padding + Restore Resolution)
-    print("✨ Restoring original resolution...")
+    else:
+        # Multi-frame generation mode
+        # Parse output filename to create a sequence pattern
+        base_name, ext = os.path.splitext(args.output)
+        frame_idx = 1
 
-    # a) Remove padding
-    crop_w = W_pad - pad_w
-    crop_h = H_pad - pad_h
-    output = output[:, :, :crop_h, :crop_w]
+        # Use generator to process frame by frame (keeps VRAM usage low)
+        for frame_tensor in recursive_generator(model, I0, I1, args.depth, dummy_points, dummy_region_flow):
 
-    # b) Upscale to exact original dimensions
-    output = F.interpolate(output, size=(orig_h, orig_w), mode='bicubic', align_corners=False)
+            # Post-process and save
+            final_output = post_process_tensor(frame_tensor, orig_w, orig_h, pad_w, pad_h)
 
-    save_image(output, args.output)
+            # Format: output_001.png, output_002.png ...
+            filename = f"{base_name}_{frame_idx:03d}{ext}"
+            save_image(final_output, filename)
+            frame_idx += 1
+
+    print("✨ Interpolation complete.")
 
 if __name__ == "__main__":
     example_text = """
 Example:
-    python inference.py --img1 frame1.png --img2 frame2.png --output result.png
+    # Standard (Single frame):
+    python inference.py --img1 start.png --img2 end.png --output result.png
 
-    # For large images (prevents Out of Memory):
-    python inference.py --img1 frame1.png --img2 frame2.png --output result.png --max_size 960
+    # Recursive (3 iterations -> 7 frames):
+    python inference.py --img1 start.png --img2 end.png --output sequence.png --depth 3
+
+    # For large images:
+    python inference.py --img1 start.png --img2 end.png --output result.png --max_size 960
     """
 
     parser = argparse.ArgumentParser(
@@ -206,8 +257,9 @@ Example:
     parser.add_argument('--img1', type=str, help='Path to the first keyframe (Start)')
     parser.add_argument('--img2', type=str, help='Path to the second keyframe (End)')
     parser.add_argument('--checkpoint', type=str, default='./ckp/checkpoints/model_best.pth', help='Path to the .pth model checkpoint')
-    parser.add_argument('--output', type=str, default='result.png', help='Path for the output interpolated image')
+    parser.add_argument('--output', type=str, default='result.png', help='Path for the output (or prefix for sequence)')
     parser.add_argument('--max_size', type=int, default=960, help='Max resolution size to avoid OOM errors (default: 960)')
+    parser.add_argument('--depth', type=int, default=1, help='Recursive interpolation depth (default: 1). depth=3 generates 7 frames.')
 
     # If run without arguments, print help and example, then exit
     if len(sys.argv) == 1:
