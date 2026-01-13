@@ -42,7 +42,7 @@ python inference.py --img1 huge_frame1.png --img2 huge_frame2.png --output resul
 
 ### 1. Pre-trained Models
 Download the pre-trained model checkpoint to run inference or resume training.
-* **[Download Model (Google Drive)](https://drive.google.com/file/d/1bPvGtm9Ty-ALrHc_NdzJQUes8elOBZfa/view?usp=sharing)**
+* **[Download Model (Google Drive)](https://drive.google.com/file/d/13ULjaDk8ydK12k68UYenteIleYELnku5/view?usp=sharing)**
 
 Place the downloaded `model_best.pth` inside `ckp/checkpoints/`.
 
